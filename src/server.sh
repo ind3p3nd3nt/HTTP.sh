@@ -1,4 +1,11 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
+# If $1 is set to true, enable the call trace
+if [[ "$1" == true ]]; then
+    set -x
+fi
+shopt -s extglob
+
 source config/master.sh
 source src/mime.sh
 source src/misc.sh
@@ -6,6 +13,7 @@ source src/account.sh
 source src/mail.sh
 source src/route.sh
 source src/template.sh
+source src/notORM.sh # to be split off HTTP.sh at some point :^)
 [[ -f "${cfg[namespace]}/config.sh" ]] && source "${cfg[namespace]}/config.sh"
 
 declare -A r # current request / response
@@ -16,94 +24,108 @@ declare -A post_data # all POST params
 declare -A params # parsed router data
 
 r[status]=210 # Mommy always said that I was special
+r[req_headers]=''
 post_length=0
 
+# start reading the stream here instead of the loop below;
+# this way, we can detect if the connection is even valid HTTP.
+# we're reading up to 8 characters and waiting for a space.
+read -d' ' -r -n8 param
+
+shopt -s nocasematch # only for initial parse; saves us *many* sed calls
+
+if [[ "${param,,}" =~ ^(get|post|patch|put|delete|meow) ]]; then # TODO: OPTIONS, HEAD
+	r[method]="${param%% *}"
+	read -r param
+	[[ "${r[method],,}" != "get" ]] && r[post]=true
+	r[url]="$(sed -E 's/^ *//;s/HTTP\/[0-9]+\.[0-9]+//;s/ //g;s/\/*\r//g;s/\/\/*/\//g' <<< "$param")"
+	unset IFS
+
+	if [[ "${r[url]}" == *'?'* ]]; then
+		while read -d'&' i; do
+			name="${i%%=*}"
+			if [[ "$name" ]]; then
+				value="${i#*=}"
+				get_data[$name]="$value"
+			fi
+		done <<< "${r[url]#*\?}&"
+	fi
+
+else
+	exit 1 # TODO: throw 400 here
+fi
+
+# continue with reading the headers
 while read -r param; do
-	param_l="${param,,}" # lowercase
+	[[ "$param" == $'\r' ]] && break
+	r[req_headers]+="$param"
+	param="${param##*( )}" # strip beginning whitespace
+	param="${param%%*( )*($'\r')}" # ... and the end whitespace
 	name=''
 	value=''
 	data=''
 	unset IFS
-	
-	if [[ "$param_l" == $'\015' ]]; then
-		break
-		
-	elif [[ "$param_l" == *"content-length:"* ]]; then
-		r[content_length]="$(sed 's/Content-Length: //i;s/\r//' <<< "$param")"
 
-	elif [[ "$param_l" == *"content-type:"* ]]; then
-		r[content_type]="$(sed 's/Content-Type: //i;s/\r//' <<< "$param")"
+	# TODO: think about refactoring those ifs; maybe we *don't* need to have a header "allowlist" afterall...
+	# TODO: some of those options are... iffy wrt case sensitiveness
+
+	if [[ "$param" == "content-length:"* ]]; then
+		r[content_length]="${param#*:*( )}"
+		declare -p param >/dev/stderr
+
+	elif [[ "$param" == "content-type:"* ]]; then
+		r[content_type]="${param#*:*( )}"
 		if [[ "${r[content_type]}" == *"multipart/form-data"* ]]; then
 			tmpdir=$(mktemp -d)
 		fi
 		if [[ "${r[content_type]}" == *"boundary="* ]]; then
-			r[content_boundary]="$(sed -E 's/(.*)boundary=//i;s/\r//;s/ //' <<< "${r[content_type]}")"
+			r[content_boundary]="${r[content_type]##*boundary=}"
 		fi
-		
-	elif [[ "$param_l" == *"host:"* ]]; then
-		r[host]="$(sed 's/Host: //i;s/\r//;s/\\//g' <<< "$param")"
-		r[host_portless]="$(sed -E 's/:(.*)$//' <<< "${r[host]}")"
+
+	elif [[ "$param" == "host:"* ]]; then
+		r[host]="${param#*:*( )}"
+		r[host_portless]="${r[host]%%:*}"
 		if [[ -f "config/$(basename -- ${r[host]})" ]]; then
 			source "config/$(basename -- ${r[host]})"
 		elif [[ -f "config/$(basename -- ${r[host_portless]})" ]]; then
 			source "config/$(basename -- ${r[host_portless]})"
 		fi
 
-	elif [[ "$param_l" == *"user-agent:"* ]]; then
-		r[user_agent]="$(sed 's/User-Agent: //i;s/\r//;s/\\//g' <<< "$param")"
-		
-	elif [[ "$param_l" == *"upgrade:"* && $(sed 's/Upgrade: //i;s/\r//' <<< "$param") == "websocket" ]]; then
+	elif [[ "$param" == "user-agent:"* ]]; then
+		r[user_agent]="${param#*:*( )}"
+
+	elif [[ "$param" == "upgrade:"* && "${param/upgrade:}" == *"websocket"* ]]; then
 		r[status]=101
-		
-	elif [[ "$param_l" == *"sec-websocket-key:"* ]]; then
-		r[websocket_key]="$(sed 's/Sec-WebSocket-Key: //i;s/\r//' <<< "$param")"
-		
-	elif [[ "$param_l" == *"authorization: basic"* ]]; then
+
+	elif [[ "$param" == "sec-websocket-key:"* ]]; then
+		r[websocket_key]="${param#*:*( )}"
+
+	elif [[ "$param" == "authorization: basic"* ]]; then
 		login_simple "$param"
-		
-	elif [[ "$param_l" == *"authorization: bearer"* ]]; then
-		r[authorization]="$(sed 's/Authorization: Bearer //i;s/\r//' <<< "$param")"
 
-	elif [[ "$param_l" == *"cookie: "* ]]; then
-		IFS=';'
-		for i in $(IFS=' '; echo "$param" | sed -E 's/Cookie: //i;;s/%/\\x/g'); do
-			name="$((grep -Poh "[^ ].*?(?==)" | head -1) <<< $i)"
-			value="$(sed "s/$name=//;s/^ //;s/ $//" <<< $i)"
-			cookies[$name]="$(echo -e $value)"
-		done
+	elif [[ "$param" == "authorization: bearer"* ]]; then
+		r[authorization]="${param#*:*( )[Bb]earer*( )}"
 
-	elif [[ "$param_l" == *"range: bytes="* ]]; then
-		r[range]="$(sed 's/Range: bytes=//;s/\r//' <<< "$param")"
-		
-	elif [[ "$param" == *"GET "* ]]; then
-		r[url]="$(echo -ne "$(url_decode "$(sed -E 's/GET //;s/HTTP\/[0-9]+\.[0-9]+//;s/ //g;s/\/*\r//g;s/\/\/*/\//g' <<< "$param")")")"
-		data="$(sed -E 's/\?/��MaE_iS_CuTe�/;s/^(.*)��MaE_iS_CuTe�//;s/\&/ /g' <<< "${r[url]}")"
-		if [[ "$data" != "${r[url]}" ]]; then
-			data="$(echo ${r[url]} | sed -E 's/^(.*)\?//')"
-			IFS='&'
-			for i in $data; do
-				name="$(sed -E 's/\=(.*)$//' <<< "$i")"
-				value="$(sed "s/$name\=//" <<< "$i")"
-				get_data[$name]="$value"
-			done
-		fi
-		
-	elif [[ "$param" == *"POST "* ]]; then
-		r[url]="$(echo -ne "$(url_decode "$(sed -E 's/POST //;s/HTTP\/[0-9]+\.[0-9]+//;s/ //g;s/\/*\r//g;s/\/\/*/\//g' <<< "$param")")")"
-		r[post]=true
-		# below shamelessly copied from GET, should be moved to a function
-		data="$(sed -E 's/\?/��MaE_iS_CuTe�/;s/^(.*)��MaE_iS_CuTe�//;s/\&/ /g' <<< "${r[url]}")"
-		if [[ "$data" != "${r[url]}" ]]; then
-			data="$(sed -E 's/^(.*)\?//' <<< "${r[url]}")"
-			IFS='&'
-			for i in $data; do
-				name="$(sed -E 's/\=(.*)$//' <<< "$i")"
-				value="$(sed "s/$name\=//" <<< "$i")"
-				post_data[$name]="$value"
-			done
-		fi		
+	elif [[ "$param" == "cookie: "* ]]; then
+		while read -d';' i; do
+			i="$(url_decode "$i")"
+			name="${i%%=*}"
+
+			if [[ "$name" ]]; then
+				# get value, strip potential whitespace
+				value="${i#*=}"
+				value="${value##*( )}"
+				value="${value%%*( )}"
+				cookies[$name]="$value"
+			fi
+		done <<< "${param//cookie:};"
+
+	elif [[ "$param" == "range: bytes="* ]]; then
+		r[range]="${param#*=}"
 	fi
 done
+
+r[url]="$(url_decode "${r[url]}")" # doing this here for.. reasons
 
 r[uri]="$(realpath "${cfg[namespace]}/${cfg[root]}$(sed -E 's/\?(.*)$//' <<< "${r[url]}")")"
 [[ -d "${r[uri]}/" ]] && pwd="${r[uri]}" || pwd=$(dirname "${r[uri]}")
@@ -116,22 +138,26 @@ else
 	r[ip]="$NCAT_REMOTE_ADDR:$NCAT_REMOTE_PORT"
 fi
 
+shopt -u nocasematch
+
 echo "$(date) - IP: ${r[ip]}, PROTO: ${r[proto]}, URL: ${r[url]}, GET_data: ${get_data[@]}, POST_data: ${post_data[@]}, POST_multipart: ${post_multipart[@]}, UA: ${r[user_agent]}" >> "${cfg[namespace]}/${cfg[log]}"
 
 [[ -f "${cfg[namespace]}/routes.sh" ]] && source "${cfg[namespace]}/routes.sh"
 
 if [[ ${r[status]} != 101 ]]; then
+	clean_url="${r[url]%\?*}"
 	for (( i=0; i<${#route[@]}; i=i+3 )); do
-		if [[ "$(grep -Poh "^${route[$((i+1))]}" <<< "${r[url]}")" != "" ]]; then
+		if [[ "$(grep -Poh "^${route[$((i+1))]}$" <<< "$clean_url")" != "" ]] || [[ "$(grep -Poh "^${route[$((i+1))]}$" <<< "$clean_url/")" != "" ]]; then
 			r[status]=212
 			r[view]="${route[$((i+2))]}"
 			IFS='/'
 			url=(${route[$i]})
-			url_=(${r[url]})
+			url_=($clean_url)
 			unset IFS
 			for (( j=0; j<${#url[@]}; j++ )); do
-				if [[ ${url_[$j]} != '' ]]; then
-					params[$(sed 's/://' <<< "${url[$j]}")]="${url_[$j]}"
+				# TODO: think about the significance of this if really hard when i'm less tired
+				if [[ ${url_[$j]} != '' && ${url[$j]} == ":"* ]]; then
+					params[${url[$j]/:/}]="${url_[$j]}"
 				fi
 			done
 			break
@@ -160,6 +186,8 @@ fi
 
 echo "${r[url]}" >&2
 
+# the app config gets loaded a second time to allow for path-specific config modification
+[[ -f "${cfg[namespace]}/config.sh" ]] && source "${cfg[namespace]}/config.sh"
 
 if [[ "${cfg[auth_required]}" == true && "${r[authorized]}" != true ]]; then
 	echo "Auth failed." >> ${cfg[log_misc]}
@@ -170,8 +198,7 @@ if [[ "${cfg[proxy]}" == true ]]; then
 	r[status]=211
 fi
 
-if [[ "${r[post]}" == true && "${r[status]}" == 200 ]]; then
-
+if [[ "${r[post]}" == true ]] && [[ "${r[status]}" == 200 ||  "${r[status]}" == 212 ]]; then
 	# This whole ordeal is here to prevent passing binary data as a variable.
 	# I could have done it as an array, but this solution works, and it's
 	# speedy enough so I don't care.
@@ -180,14 +207,14 @@ if [[ "${r[post]}" == true && "${r[status]}" == 200 ]]; then
 		declare post_multipart
 		tmpfile=$(mktemp -p $tmpdir)
 		dd iflag=fullblock of=$tmpfile ibs=${r[content_length]} count=1 obs=1M
-		
+
 		delimeter_len=$(echo -n "${r[content_boundary]}"$'\015' | wc -c)
 		boundaries_list=$(echo -ne $(grep $tmpfile -ao -e ${r[content_boundary]} --byte-offset | sed -E 's/:(.*)//g') | sed -E 's/ [0-9]+$//')
-		
+
 		for i in $boundaries_list; do
 			tmpout=$(mktemp -p $tmpdir)
 			dd iflag=fullblock if=$tmpfile ibs=$(($i+$delimeter_len)) obs=1M skip=1 | while true; do
-				read line
+				read -r line
 				if [[ $line == $'\015' ]]; then
 					cat - > $tmpout
 					break
@@ -201,20 +228,18 @@ if [[ "${r[post]}" == true && "${r[status]}" == 200 ]]; then
 		done
 		rm $tmpfile
 	else
-		read -N "${r[content_length]}" data
-		
-		IFS='&'
-		for i in $(tr -d '\n' <<< "$data"); do
-			name="$(sed -E 's/\=(.*)$//' <<< "$i")"
-			param="$(sed "s/$name\=//" <<< "$i")"
-			post_data[$name]="$param"
-		done
+		read -r -N "${r[content_length]}" data
+
 		unset IFS
+		while read -r -d'&' i; do
+			name="${i%%=*}"
+			value="${i#*=}"
+			post_data[$name]="$value"
+			echo post_data[$name]="$value" >/dev/stderr
+
+		done <<< "${data}&"
 	fi
 fi
-
-# the app config gets loaded a second time to allow for path-specific config modification
-[[ -f "${cfg[namespace]}/config.sh" ]] && source "${cfg[namespace]}/config.sh"
 
 if [[ ${r[status]} == 210 && ${cfg[autoindex]} == true ]]; then
 	source "src/response/listing.sh"

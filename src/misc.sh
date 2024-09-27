@@ -1,14 +1,14 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # misc.sh - miscellaneous functions
 
 # set_cookie(cookie_name, cookie_content)
 function set_cookie() {
-	r[headers]+="Set-Cookie: $1=$2\r\n"
+	r[headers]+="Set-Cookie: $1=$2; Path=${cfg[cookie_path]}\r\n"
 }
 
 # set_cookie_permanent(cookie_name, cookie_content)
 function set_cookie_permanent() {
-	r[headers]+="Set-Cookie: $1=$2; Expires=Mon, 26 Jul 2100 22:45:00 GMT\r\n"
+	r[headers]+="Set-Cookie: $1=$2; Expires=Mon, 26 Jul 2100 22:45:00 GMT; Path=${cfg[cookie_path]}\r\n"
 }
 
 # remove_cookie(cookie_name)
@@ -39,15 +39,32 @@ function post_dump() {
 
 # html_encode(string)
 function html_encode() {
-	sed 's/\&/\&amp;/g;s/</\&#60;/g;s/>/\&#62;/g;s/%/\&#37;/g;s/\//\&#47;/g;s/\\/\&#92;/g;s/'"'"'/\&#39;/g;s/"/\&#34;/g;s/`/\&#96;/g;s/?/\&#63;/g;' <<< "$1"
+	if [[ "$1" == "" ]]; then
+		sed 's/\&/\&amp;/g;s/</\&#60;/g;s/>/\&#62;/g;s/%/\&#37;/g;s/\//\&#47;/g;s/\\/\&#92;/g;s/'"'"'/\&#39;/g;s/"/\&#34;/g;s/`/\&#96;/g;s/?/\&#63;/g;'
+	else
+		sed 's/\&/\&amp;/g;s/</\&#60;/g;s/>/\&#62;/g;s/%/\&#37;/g;s/\//\&#47;/g;s/\\/\&#92;/g;s/'"'"'/\&#39;/g;s/"/\&#34;/g;s/`/\&#96;/g;s/?/\&#63;/g;' <<< "$1"
+	fi
 }
 
 # url_encode(string)
 function url_encode() {
-	xxd -ps -u <<< "$1" | tr -d '\n' | sed -E 's/.{2}/%&/g'
+	echo -n "$1" | xxd -p | tr -d '\n' | sed -E 's/.{2}/%&/g'
 }
 
 # url_decode(string)
 function url_decode() {
-	echo -ne "$(sed -E 's/%[0-1][0-9a-f]//g;s/%/\\x/g' <<< "$1")"
+	# we should probably fail on invalid data here,
+	# but this function is kinda sorta infallible right now
+
+	local t=$'\01'
+	local a="${1//$t}" # strip all of our control chrs for safety
+	a="${1//+/ }" # handle whitespace
+	a="${a//%[A-Fa-f0-9][A-Fa-f0-9]/$t&}" # match '%xx', prepend with token
+	echo -ne "${a//$t%/\\x}" # replace the above with '\\x' and evaluate
+}
+
+# bogus function!
+# this is here to prevent "command not found" errors in debug mode
+function worker_add() {
+	:
 }
